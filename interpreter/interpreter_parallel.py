@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Python interpreter for executing code snippets and capturing their output.
 Supports:
@@ -9,8 +11,11 @@ Supports:
 import logging
 import os
 import queue
+import re
 import signal
+import subprocess
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -21,6 +26,35 @@ import humanize
 from dataclasses_json import DataClassJsonMixin
 
 from types import SimpleNamespace
+
+def _parse_int_env(name: str, *, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    if raw.lower() in ("auto", "max"):
+        return -1
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+def _compute_thread_cap(cpu_budget: int) -> int:
+    """
+    Compute the per-process thread cap for BLAS / OpenMP / ML libraries.
+
+    Defaults to 1 (safe, avoids oversubscription). Override via:
+      - MLMASTER_THREAD_CAP=<int>   (or "auto"/"max" to use cpu_budget)
+    """
+    cpu_budget = max(1, int(cpu_budget))
+    requested = _parse_int_env("MLMASTER_THREAD_CAP", default=1)
+    if requested in (0, -1):
+        return cpu_budget
+    return max(1, min(cpu_budget, requested))
+
 
 def trim_long_string(string, threshold=5100, k=2500):
     # Check if the length of the string is longer than the threshold
@@ -135,7 +169,33 @@ class Interpreter:
         self.cpu_number = int(cfg.cpu_number)
         if self.cpu_number < self.max_parallel_run:
             raise ValueError("The maximum level of parallelism exceeds the number of allocated CPU cores; ensure that each process has at least one CPU core.")
-        self.lock = Lock()
+        self._interpreter_mode = os.environ.get("MLMASTER_INTERPRETER_MODE", "auto").strip().lower()
+        self._use_multiprocessing = self._interpreter_mode in ("auto", "multiprocessing", "mp", "")
+        if self._interpreter_mode in ("subprocess", "popen", "no-mp", "nomp"):
+            self._use_multiprocessing = False
+
+        if self._use_multiprocessing:
+            try:
+                # In some sandboxed environments, multiprocessing primitives fail due to /dev/shm restrictions.
+                # Detect and fall back to a subprocess-based interpreter.
+                self.lock = Lock()
+                _q = Queue()
+                try:
+                    _q.close()
+                except Exception:
+                    pass
+            except PermissionError as e:
+                if self._interpreter_mode in ("multiprocessing", "mp"):
+                    raise
+                logger.warning(
+                    "Multiprocessing primitives are unavailable (%s). Falling back to subprocess interpreter. "
+                    "Set MLMASTER_INTERPRETER_MODE=multiprocessing to force multiprocessing (may fail).",
+                    e,
+                )
+                self._use_multiprocessing = False
+                self.lock = threading.Lock()
+        else:
+            self.lock = threading.Lock()
 
     def check_current_status(self):
         '''
@@ -169,19 +229,25 @@ class Interpreter:
 
     def child_proc_setup(self, result_outq: Queue) -> None:
         try:
-            print("[child_proc_setup] import shutup...")
+            verbose = os.environ.get("MLMASTER_CHILD_SETUP_DEBUG", "").strip() not in ("", "0", "false", "False")
+            if verbose:
+                print("[child_proc_setup] import shutup...")
             import shutup
 
-            print("[child_proc_setup] mute_warnings...")
+            if verbose:
+                print("[child_proc_setup] mute_warnings...")
             shutup.mute_warnings()
 
-            print(f"[child_proc_setup] chdir to {self.working_dir}...")
+            if verbose:
+                print(f"[child_proc_setup] chdir to {self.working_dir}...")
             os.chdir(str(self.working_dir))
 
-            print("[child_proc_setup] append to sys.path...")
+            if verbose:
+                print("[child_proc_setup] append to sys.path...")
             sys.path.append(str(self.working_dir))
 
-            print("[child_proc_setup] redirect stdout/stderr...")
+            if verbose:
+                print("[child_proc_setup] redirect stdout/stderr...")
             sys.stdout = sys.stderr = RedirectQueue(result_outq)
 
         except Exception as e:
@@ -213,22 +279,114 @@ class Interpreter:
     def _run_session(
         self, code_inq: Queue, result_outq: Queue, event_outq: Queue, process_id: int
     ) -> None:
-        
+        cpu_number_per_session = max(1, int(self.cpu_number / self.max_parallel_run))
+        start_cpu_id_session = self.start_cpu_id + process_id * cpu_number_per_session
+        cpu_set = set(range(start_cpu_id_session, start_cpu_id_session + cpu_number_per_session))
+        thread_cap = _compute_thread_cap(len(cpu_set))
+
+        # Best-effort safety controls for nested parallelism:
+        # - keep joblib/loky from forking more processes
+        # - cap BLAS threads to the per-session CPU budget
+        # - force some libraries to stay single-threaded
+        try:
+            os.sched_setaffinity(0, cpu_set)
+        except Exception:
+            pass
+
+        def _cap_env(name: str, value: int) -> None:
+            current = os.environ.get(name)
+            if not current:
+                os.environ[name] = str(value)
+                return
+            try:
+                if int(current) > value:
+                    os.environ[name] = str(value)
+            except Exception:
+                os.environ[name] = str(value)
+
+        def _force_env(name: str, value: str) -> None:
+            os.environ[name] = value
+
+        for env_name in [
+            "MLMASTER_NUM_THREADS",
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "BLIS_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+            "CATBOOST_THREAD_COUNT",
+            "XGBOOST_NUM_THREADS",
+            "LIGHTGBM_NUM_THREADS",
+        ]:
+            _cap_env(env_name, thread_cap)
+
+        # Force single-thread / single-process for known nested-parallel libs.
+        _force_env("NUMEXPR_NUM_THREADS", "1")
+        _force_env("NUMEXPR_MAX_THREADS", "1")
+        _force_env("SKLEARN_N_JOBS", "1")
+        _force_env("TOKENIZERS_PARALLELISM", "false")
+        _force_env("RAYON_NUM_THREADS", "1")
+        _force_env("LOKY_MAX_CPU_COUNT", "1")
+
+        try:
+            from threadpoolctl import threadpool_limits as _mlm_threadpool_limits
+
+            _mlm_threadpool_limits(thread_cap)
+        except Exception:
+            pass
+
         self.child_proc_setup(result_outq)
         
-        global_scope: dict = {}
-        global_scope["__name__"] = "__main__"
         while True:
             
             code, id = code_inq.get()
             os.chdir(str(self.working_dir))
-            cpu_number_per_session = int(self.cpu_number / self.max_parallel_run)
-            start_cpu_id_session = self.start_cpu_id + process_id * cpu_number_per_session
-            cpu_set = set()
-            for i in range(start_cpu_id_session,start_cpu_id_session+cpu_number_per_session):
-                cpu_set.add(i)
-            logger.info(f"has set process_id:{process_id} to use cpu: {cpu_set}")
-            pre_code = "import os\nos.sched_setaffinity(0, {cpu_set})\n".format(cpu_set=cpu_set)
+            # Run each snippet in a fresh module-like namespace to avoid state leakage
+            # (and memory bloat) across executions, while still reusing the same
+            # long-lived REPL process for speed.
+            global_scope: dict = {"__name__": "__main__"}
+            pre_code = (
+                "import os\n"
+                f"try:\n    os.sched_setaffinity(0, {cpu_set})\nexcept Exception:\n    pass\n"
+                f"_MLMASTER_THREAD_CAP = int({thread_cap})\n"
+                "_MLMASTER_THREAD_CAP_STR = str(_MLMASTER_THREAD_CAP)\n"
+                "def _mlm_cap_env(_name: str) -> None:\n"
+                "    _v = os.environ.get(_name)\n"
+                "    if not _v:\n"
+                "        os.environ[_name] = _MLMASTER_THREAD_CAP_STR\n"
+                "        return\n"
+                "    try:\n"
+                "        if int(_v) > _MLMASTER_THREAD_CAP:\n"
+                "            os.environ[_name] = _MLMASTER_THREAD_CAP_STR\n"
+                "    except Exception:\n"
+                "        os.environ[_name] = _MLMASTER_THREAD_CAP_STR\n"
+                "for _k in [\n"
+                "    'MLMASTER_NUM_THREADS',\n"
+                "    'OMP_NUM_THREADS',\n"
+                "    'MKL_NUM_THREADS',\n"
+                "    'OPENBLAS_NUM_THREADS',\n"
+                "    'BLIS_NUM_THREADS',\n"
+                "    'VECLIB_MAXIMUM_THREADS',\n"
+                "    'CATBOOST_THREAD_COUNT',\n"
+                "    'XGBOOST_NUM_THREADS',\n"
+                "    'LIGHTGBM_NUM_THREADS',\n"
+                "]:\n"
+                "    _mlm_cap_env(_k)\n"
+                "del _k\n"
+                "def _mlm_force_env(_name: str, _value: str) -> None:\n"
+                "    os.environ[_name] = _value\n"
+                "_mlm_force_env('NUMEXPR_NUM_THREADS', '1')\n"
+                "_mlm_force_env('NUMEXPR_MAX_THREADS', '1')\n"
+                "_mlm_force_env('SKLEARN_N_JOBS', '1')\n"
+                "_mlm_force_env('TOKENIZERS_PARALLELISM', 'false')\n"
+                "_mlm_force_env('RAYON_NUM_THREADS', '1')\n"
+                "_mlm_force_env('LOKY_MAX_CPU_COUNT', '1')\n"
+                "try:\n"
+                "    from threadpoolctl import threadpool_limits as _mlm_threadpool_limits\n"
+                "    _mlm_threadpool_limits(_MLMASTER_THREAD_CAP)\n"
+                "except Exception:\n"
+                "    pass\n"
+            )
             
             code  = self.replace_submission_name(code=code, _id=id)
             code = pre_code + code
@@ -256,6 +414,13 @@ class Interpreter:
             # remove the file after execution (otherwise it might be included in the data preview)
             os.remove(self.agent_file_name[process_id])
 
+            try:
+                import gc
+
+                gc.collect()
+            except Exception:
+                pass
+
             # put EOF marker to indicate that we're done
             result_outq.put("<|EOF|>")
 
@@ -265,7 +430,7 @@ class Interpreter:
         # - result_outq: receive stdout/stderr from child
         # - event_outq: receive events from child (e.g. state:ready, state:finished)
         # trunk-ignore(mypy/var-annotated)
-        print(f"create process for {process_id}")
+        logger.debug("create_process(process_id=%s)", process_id)
         self.code_inq[process_id], self.result_outq[process_id], self.event_outq[process_id] = Queue(), Queue(), Queue()
         self.process[process_id] = Process(
             target=self._run_session,
@@ -273,11 +438,164 @@ class Interpreter:
         )
         self.process[process_id].start()
 
-    def cleanup_session(self,process_id):
+    def _infer_exc_type_from_output(self, output: str) -> str | None:
+        if not output:
+            return None
+        for line in reversed(output.splitlines()):
+            s = line.strip()
+            if not s:
+                continue
+            m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)(?::|$)", s)
+            if not m:
+                continue
+            name = m.group(1)
+            if name == "KeyboardInterrupt":
+                return "TimeoutError"
+            if name.endswith("Error") or name.endswith("Exception"):
+                return name
+        return None
+
+    def _run_subprocess(self, code: str, id, process_id: int) -> ExecutionResult:
+        start_time = time.time()
+
+        cpu_number_per_session = int(self.cpu_number / self.max_parallel_run)
+        start_cpu_id_session = self.start_cpu_id + process_id * cpu_number_per_session
+        cpu_set = set(range(start_cpu_id_session, start_cpu_id_session + cpu_number_per_session))
+
+        thread_cap = _compute_thread_cap(len(cpu_set))
+        pre_code = (
+            "import os\n"
+            f"try:\n    os.sched_setaffinity(0, {cpu_set})\n"
+            "except Exception:\n    pass\n"
+            f"_MLMASTER_THREAD_CAP = int({thread_cap})\n"
+            "_MLMASTER_THREAD_CAP_STR = str(_MLMASTER_THREAD_CAP)\n"
+            "def _mlm_cap_env(_name: str) -> None:\n"
+            "    _v = os.environ.get(_name)\n"
+            "    if not _v:\n"
+            "        os.environ[_name] = _MLMASTER_THREAD_CAP_STR\n"
+            "        return\n"
+            "    try:\n"
+            "        if int(_v) > _MLMASTER_THREAD_CAP:\n"
+            "            os.environ[_name] = _MLMASTER_THREAD_CAP_STR\n"
+            "    except Exception:\n"
+            "        os.environ[_name] = _MLMASTER_THREAD_CAP_STR\n"
+            "for _k in [\n"
+            "    'MLMASTER_NUM_THREADS',\n"
+            "    'OMP_NUM_THREADS',\n"
+            "    'MKL_NUM_THREADS',\n"
+            "    'OPENBLAS_NUM_THREADS',\n"
+            "    'BLIS_NUM_THREADS',\n"
+            "    'VECLIB_MAXIMUM_THREADS',\n"
+            "    'CATBOOST_THREAD_COUNT',\n"
+            "    'XGBOOST_NUM_THREADS',\n"
+            "    'LIGHTGBM_NUM_THREADS',\n"
+            "]:\n"
+            "    _mlm_cap_env(_k)\n"
+            "del _k\n"
+            "def _mlm_force_env(_name: str, _value: str) -> None:\n"
+            "    os.environ[_name] = _value\n"
+            "_mlm_force_env('NUMEXPR_NUM_THREADS', '1')\n"
+            "_mlm_force_env('NUMEXPR_MAX_THREADS', '1')\n"
+            "_mlm_force_env('SKLEARN_N_JOBS', '1')\n"
+            "_mlm_force_env('TOKENIZERS_PARALLELISM', 'false')\n"
+            "_mlm_force_env('RAYON_NUM_THREADS', '1')\n"
+            "_mlm_force_env('LOKY_MAX_CPU_COUNT', '1')\n"
+            "try:\n"
+            "    from threadpoolctl import threadpool_limits as _mlm_threadpool_limits\n"
+            "    _mlm_threadpool_limits(_MLMASTER_THREAD_CAP)\n"
+            "except Exception:\n"
+            "    pass\n"
+        )
+
+        code = self.replace_submission_name(code=code, _id=id)
+        code = pre_code + code
+
+        runfile_name = self.agent_file_name[process_id]
+        runfile_path = self.working_dir / runfile_name
+        runfile_path.write_text(code)
+
+        proc = subprocess.Popen(
+            [sys.executable, runfile_name],
+            cwd=str(self.working_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        timed_out = False
+        try:
+            if self.timeout is None:
+                out, _ = proc.communicate()
+            else:
+                out, _ = proc.communicate(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            proc.kill()
+            out, _ = proc.communicate()
+
+        exec_time = time.time() - start_time
+
+        term_out: list[str] = []
+        if out:
+            term_out.extend(out.splitlines(True))
+
+        exc_type: str | None = None
+        exc_info: dict | None = None
+        exc_stack: list[tuple] | None = None
+
+        if timed_out:
+            exc_type = "TimeoutError"
+            if self.timeout is not None:
+                exec_time = float(self.timeout)
+            term_out.append(
+                f"TimeoutError: Execution exceeded the time limit of {humanize.naturaldelta(self.timeout)}"
+            )
+        else:
+            if proc.returncode not in (0, None):
+                exc_type = self._infer_exc_type_from_output(out) or "RuntimeError"
+            term_out.append(
+                f"Execution time: {humanize.naturaldelta(exec_time)} seconds (time limit is {humanize.naturaldelta(self.timeout)})."
+            )
+
+        try:
+            runfile_path.unlink()
+        except Exception:
+            pass
+
+        return ExecutionResult(term_out, exec_time, exc_type, exc_info, exc_stack)
+
+    def cleanup_session(self, process_id: int, *, close_queues: bool = True):
+        if not self._use_multiprocessing:
+            return
+
+        def _close_queue(q) -> None:
+            if q is None:
+                return
+            # `multiprocessing.Queue.join_thread()` can block indefinitely if the
+            # feeder thread is wedged (e.g., child process crash / forced kill).
+            # We prefer a best-effort cleanup that never hangs the main loop.
+            try:
+                cancel = getattr(q, "cancel_join_thread", None)
+                if callable(cancel):
+                    cancel()
+            except Exception:
+                pass
+            try:
+                q.close()
+            except Exception:
+                pass
+
         if process_id == -1 : #clean all process
             for pid in range(self.max_parallel_run):
                 if self.process[pid] is None:
-                    return
+                    if close_queues:
+                        _close_queue(self.code_inq[pid])
+                        _close_queue(self.result_outq[pid])
+                        _close_queue(self.event_outq[pid])
+                        self.code_inq[pid] = None
+                        self.result_outq[pid] = None
+                        self.event_outq[pid] = None
+                    continue
                 # give the child process a chance to terminate gracefully
                 self.process[pid].terminate()
                 self.process[pid].join(timeout=2)
@@ -289,8 +607,22 @@ class Interpreter:
                 # don't wait for gc, clean up immediately
                 self.process[pid].close()
                 self.process[pid] = None  # type: ignore
+                if close_queues:
+                    _close_queue(self.code_inq[pid])
+                    _close_queue(self.result_outq[pid])
+                    _close_queue(self.event_outq[pid])
+                    self.code_inq[pid] = None
+                    self.result_outq[pid] = None
+                    self.event_outq[pid] = None
         else: #clean given process
             if self.process[process_id] is None:
+                if close_queues:
+                    _close_queue(self.code_inq[process_id])
+                    _close_queue(self.result_outq[process_id])
+                    _close_queue(self.event_outq[process_id])
+                    self.code_inq[process_id] = None
+                    self.result_outq[process_id] = None
+                    self.event_outq[process_id] = None
                 return
             # give the child process a chance to terminate gracefully
             self.process[process_id].terminate()
@@ -303,6 +635,13 @@ class Interpreter:
             # don't wait for gc, clean up immediately
             self.process[process_id].close()
             self.process[process_id] = None  # type: ignore
+            if close_queues:
+                _close_queue(self.code_inq[process_id])
+                _close_queue(self.result_outq[process_id])
+                _close_queue(self.event_outq[process_id])
+                self.code_inq[process_id] = None
+                self.result_outq[process_id] = None
+                self.event_outq[process_id] = None
 
     def run(self, code: str, id, reset_session=True):
         """
@@ -318,137 +657,172 @@ class Interpreter:
         """
         logger.info(f"REPL is executing code (reset_session={reset_session})")
         logger.info(f"Current running process: {self.current_parallel_run}")
-        process_id = None 
-        # assign process_id
-        with self.lock:
-            self.current_parallel_run += 1
-            for idx in range(self.max_parallel_run):
-                if self.status_map[idx] == 0:
-                    self.status_map[idx] = 1 # signals occupied
-                    process_id = idx
-                    logger.info(f"has assigned process_id，process_id is {process_id}")
-                    break
-                elif idx == self.max_parallel_run-1: # if not assigned
+        process_id = None
+        reuse_process = os.environ.get("MLMASTER_REPL_REUSE_PROCESS", "1") != "0"
+        try:
+            # assign process_id
+            with self.lock:
+                for idx in range(self.max_parallel_run):
+                    if self.status_map[idx] == 0:
+                        self.status_map[idx] = 1  # signals occupied
+                        process_id = idx
+                        self.current_parallel_run += 1
+                        logger.info(f"has assigned process_id，process_id is {process_id}")
+                        break
+                if process_id is None:
                     logger.info("reach max process parallel number")
                     raise ValueError("reach max process parallel number")
-        
-        if reset_session:
-            if self.process[process_id] is not None:
-                # terminate and clean up previous process
+
+            if not self._use_multiprocessing:
+                return self._run_subprocess(code=code, id=id, process_id=process_id)
+		        
+            # Prefer reusing the child REPL process for speed. We already execute each
+            # snippet in a fresh namespace inside `_run_session`, so we don't need to
+            # tear down the process between runs unless explicitly requested.
+            if self.process[process_id] is None or (
+                hasattr(self.process[process_id], "is_alive") and not self.process[process_id].is_alive()
+            ):
+                self.create_process(process_id=process_id)
+            elif reset_session and not reuse_process:
                 try:
                     self.cleanup_session(process_id=process_id)
-                except Exception as e:
-                    logger.warning('reset_session cause a  bug in self.cleanup_session, the full traceback is:')
-                    error_message = traceback.format_exc()
-                    logger.warning(error_message) # Most likely, this process has already been killed, and killing the same process repeatedly has caused it to run normally
+                except Exception:
+                    logger.warning("Failed to cleanup_session during reset; continuing.")
+                self.create_process(process_id=process_id)
 
-            self.create_process(process_id=process_id)
-        else:
-            # reset_session needs to be True on first exec
-            assert self.process[process_id] is not None
+            assert self.process[process_id].is_alive()
 
-        assert self.process[process_id].is_alive()
-
-        self.code_inq[process_id].put((code, id))
-        # wait for child to actually start execution (we don't want interrupt child setup)
-        try:
-            state = self.event_outq[process_id].get(timeout=10)
-        except queue.Empty:
-            msg = "REPL child process failed to start execution"
-            logger.critical(msg)
-            queue_dump = ""
-            while not self.result_outq[process_id].empty():
-                queue_dump = self.result_outq[process_id].get()
-                logger.error(f"REPL output queue dump: {queue_dump[:1000]}")
-            self.cleanup_session(process_id=process_id) 
-            self.current_parallel_run -= 1 # Although it's a timeout, we still need to clean up the process table
-            self.status_map[process_id] = 0
-            return ExecutionResult(  # Considered as running timeout
-                term_out=[msg, queue_dump],
-                exec_time=0,
-                exc_type="RuntimeError",
-                exc_info={},
-                exc_stack=[],
-            )
-        assert state[0] == "state:ready", state
-        start_time = time.time()
-
-        # this flag indicates that the child ahs exceeded the time limit and an interrupt was sent
-        # if the child process dies without this flag being set, it's an unexpected termination
-        child_in_overtime = False
-        while True:
+            self.code_inq[process_id].put((code, id))
+            # wait for child to actually start execution (we don't want interrupt child setup)
             try:
-                # check if the child is done
-                state = self.event_outq[process_id].get(timeout=1)  # wait for state:finished
-                assert state[0] == "state:finished", state
-                exec_time = time.time() - start_time
-                break
+                state = self.event_outq[process_id].get(timeout=10)
             except queue.Empty:
-                # we haven't heard back from the child -> check if it's still alive (assuming overtime interrupt wasn't sent yet)
-                if not child_in_overtime and not self.process[process_id].is_alive():
-                    msg = "REPL child process died unexpectedly"
-                    logger.critical(msg)
-                    queue_dump = ""
-                    while not self.result_outq[process_id].empty():
-                        queue_dump = self.result_outq[process_id].get()
-                        logger.error(f"REPL output queue dump: {queue_dump[:1000]}")
-                    self.cleanup_session(process_id=process_id)
-                    self.current_parallel_run -= 1 # Although it's a timeout, we still need to clean up the process table
-                    self.status_map[process_id] = 0
-                    return ExecutionResult(
-                        term_out=[msg, queue_dump],
-                        exec_time=0,
-                        exc_type="RuntimeError",
-                        exc_info={},
-                        exc_stack=[],
-                    )
+                msg = "REPL child process failed to start execution"
+                logger.critical(msg)
+                queue_dump = ""
+                while not self.result_outq[process_id].empty():
+                    queue_dump = self.result_outq[process_id].get()
+                    logger.error(f"REPL output queue dump: {queue_dump[:1000]}")
+                return ExecutionResult(  # Considered as running timeout
+                    term_out=[msg, queue_dump],
+                    exec_time=0,
+                    exc_type="RuntimeError",
+                    exc_info={},
+                    exc_stack=[],
+                )
 
-                # child is alive and still executing -> check if we should sigint..
-                if self.timeout is None:
-                    continue
-                running_time = time.time() - start_time
-                if running_time > self.timeout:
+            assert state[0] == "state:ready", state
+            start_time = time.time()
 
-                    # [TODO] handle this in a better way
-                    assert reset_session, "Timeout ocurred in interactive session"
+            # this flag indicates that the child ahs exceeded the time limit and an interrupt was sent
+            # if the child process dies without this flag being set, it's an unexpected termination
+            child_in_overtime = False
+            while True:
+                try:
+                    # check if the child is done
+                    state = self.event_outq[process_id].get(timeout=1)  # wait for state:finished
+                    assert state[0] == "state:finished", state
+                    exec_time = time.time() - start_time
+                    break
+                except queue.Empty:
+                    # we haven't heard back from the child -> check if it's still alive (assuming overtime interrupt wasn't sent yet)
+                    if not child_in_overtime and not self.process[process_id].is_alive():
+                        msg = "REPL child process died unexpectedly"
+                        logger.critical(msg)
+                        queue_dump = ""
+                        while not self.result_outq[process_id].empty():
+                            queue_dump = self.result_outq[process_id].get()
+                            logger.error(f"REPL output queue dump: {queue_dump[:1000]}")
+                        return ExecutionResult(
+                            term_out=[msg, queue_dump],
+                            exec_time=0,
+                            exc_type="RuntimeError",
+                            exc_info={},
+                            exc_stack=[],
+                        )
 
-                    # send interrupt to child
-                    os.kill(self.process[process_id].pid, signal.SIGINT)  # type: ignore
-                    child_in_overtime = True
-                    # terminate if we're overtime by more than a minute
-                    if running_time > self.timeout + 60:
-                        logger.warning("Child failed to terminate, killing it..")
-                        self.cleanup_session(process_id=process_id)
+                    # child is alive and still executing -> check if we should sigint..
+                    if self.timeout is None:
+                        continue
+                    running_time = time.time() - start_time
+                    if running_time > self.timeout:
 
-                        state = (None, "TimeoutError", {}, [])
-                        exec_time = self.timeout
+                        # [TODO] handle this in a better way
+                        assert reset_session, "Timeout ocurred in interactive session"
+
+                        # send interrupt to child
+                        os.kill(self.process[process_id].pid, signal.SIGINT)  # type: ignore
+                        child_in_overtime = True
+                        # terminate if we're overtime by more than a minute
+                        if running_time > self.timeout + 60:
+                            logger.warning("Child failed to terminate, killing it..")
+                            # Keep queues open so we can still drain any buffered output.
+                            self.cleanup_session(process_id=process_id, close_queues=False)
+
+                            state = (None, "TimeoutError", {}, [])
+                            exec_time = self.timeout
+                            break
+
+            output: list[str] = []
+            # Read stdout/stderr from child up to the EOF marker.
+            # IMPORTANT: never block forever if EOF is missing (child crash / forced kill).
+            saw_eof = False
+            drain_start = time.time()
+            drain_timeout_s = int(
+                os.environ.get("MLMASTER_REPL_DRAIN_TIMEOUT_S", "15") or "15"
+            )
+            while True:
+                try:
+                    res = self.result_outq[process_id].get(timeout=1)
+                    output.append(res)
+                    if res == "<|EOF|>":
+                        saw_eof = True
+                        break
+                except queue.Empty:
+                    if not self.process[process_id].is_alive():
+                        break
+                    if time.time() - drain_start > drain_timeout_s:
                         break
 
-        output: list[str] = []
-        # read all stdout/stderr from child up to the EOF marker
-        # waiting until the queue is empty is not enough since
-        # the feeder thread in child might still be adding to the queue
-        while not self.result_outq[process_id].empty() or not output or output[-1] != "<|EOF|>":
-            res = self.result_outq[process_id].get()
-            output.append(res)
-            
-        output.pop()  # remove the EOF marker
+            if saw_eof:
+                output.pop()  # remove the EOF marker
+            else:
+                logger.warning(
+                    "REPL output missing EOF marker (process_id=%s). Drained %d chunks before continuing.",
+                    process_id,
+                    len(output),
+                )
 
-        e_cls_name, exc_info, exc_stack = state[1:]
+            e_cls_name, exc_info, exc_stack = state[1:]
 
-        if e_cls_name == "TimeoutError":
-            output.append(
-                f"TimeoutError: Execution exceeded the time limit of {humanize.naturaldelta(self.timeout)}"
+            if e_cls_name == "TimeoutError":
+                output.append(
+                    f"TimeoutError: Execution exceeded the time limit of {humanize.naturaldelta(self.timeout)}"
+                )
+            else:
+                output.append(
+                    f"Execution time: {humanize.naturaldelta(exec_time)} seconds (time limit is {humanize.naturaldelta(self.timeout)})."
+                )
+            logger.debug(
+                "execution done (process_id=%s, exec_time=%.3fs, exc_type=%s)",
+                process_id,
+                exec_time,
+                e_cls_name,
             )
-        else:
-            output.append(
-                f"Execution time: {humanize.naturaldelta(exec_time)} seconds (time limit is {humanize.naturaldelta(self.timeout)})."
-            )
-        print("execution done",ExecutionResult(output, exec_time, e_cls_name, exc_info, exc_stack))
-        self.current_parallel_run -= 1
-        self.status_map[process_id] = 0
-        self.cleanup_session(process_id=process_id) # Clean up the process after running it
-        return ExecutionResult(output, exec_time, e_cls_name, exc_info, exc_stack)
+            return ExecutionResult(output, exec_time, e_cls_name, exc_info, exc_stack)
+        finally:
+            if process_id is not None:
+                try:
+                    if self._use_multiprocessing and not reuse_process:
+                        self.cleanup_session(process_id=process_id)
+                except Exception:
+                    pass
+                try:
+                    with self.lock:
+                        self.current_parallel_run -= 1
+                        self.status_map[process_id] = 0
+                except Exception:
+                    pass
 
 if __name__ == "__main__":
     cfg = SimpleNamespace()
@@ -724,6 +1098,3 @@ if __name__ == "__main__":
     result = interpreter.replace_submission_name(test_code, _id="12345")
     print(result)
     
-
-
-

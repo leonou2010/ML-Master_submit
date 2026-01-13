@@ -12,6 +12,10 @@ from utils.config_mcts import load_cfg
 
 cfg = load_cfg()
 # PRIVATE_DATA_DIR = "/private/data"
+if cfg.dataset_dir is None:
+    raise ValueError(
+        "`dataset_dir` must be provided when running the grading server (e.g. dataset_dir=/path/to/mle-bench)."
+    )
 base_dir = cfg.dataset_dir
 
 def run_validation(submission: Path, competition_id: str) -> str:

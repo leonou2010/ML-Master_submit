@@ -1,6 +1,6 @@
 """configuration and setup utils"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 from typing import Hashable, cast, Literal
@@ -12,6 +12,7 @@ from rich.syntax import Syntax
 import shutup
 from rich.logging import RichHandler
 import logging
+import shutil
 
 from search.journal import Journal, filter_journal
 
@@ -72,6 +73,15 @@ class SearchConfig:
     num_improves: int
     max_improve_failure: int
     parallel_search_num: int
+    # Bug consultant (RAG + RL + Summarization debugging)
+    use_bug_consultant: bool = False
+    max_bug_records: int = 500
+    advice_budget_chars: int = 200000
+    max_active_bugs: int = 200
+    max_trials_per_bug: int = 20
+    delete_pruned_bug_files: bool = False
+    bug_context_mode: str = "consultant"  # consultant | buggy_code | both
+    bug_context_count: int = 0
 
 @dataclass
 class AgentConfig:
@@ -98,9 +108,58 @@ class ExecConfig:
 
 
 @dataclass
+class PostSearchConfig:
+    """
+    Configuration for selecting final solution after MCTS search.
+    Copied from AIDE to test robust selection strategies.
+    """
+    enabled: bool = True
+    selection: str = "best_valid"  # best_valid | maximin | elite_maximin | mean_minus_k_std
+    top_k: int = 20
+    k_std: float = 2.0
+    z_threshold: float = 2.0
+    guard_std: float = 2.0
+    elite_top_k: int = 3
+    elite_ratio: float = 0.05
+    elite_k_std: float = 2.0
+
+
+@dataclass
+class PlanConstraintsConfig:
+    """
+    Configuration for plan/sketch constraints.
+    Copied from AIDE to test if constraining plan length improves solution quality.
+    Note: Constraints are enforced via prompting only, not via truncation.
+    """
+    enabled: bool = False
+    max_sentences: int = 5
+
+
+@dataclass
+class PerStepGradingConfig:
+    """
+    Configuration for per-step grading (generalization gap experiments).
+    Grades all selection methods at each MCTS step using MLE-bench ground truth.
+    """
+    enabled: bool = False
+    mlebench_data_dir: str = "/home/ka3094/mle-bench/data/competitions"
+    methods: list[str] = field(
+        default_factory=lambda: [
+            "best_valid",
+            "mean_minus_k_std",
+            "maximin",
+            "elite_maximin",
+        ]
+    )
+    grade_every_n_steps: int = 1
+    # Write `per_step_grading/grading_history.*` incrementally during the run.
+    save_every_n_steps: int = 1
+
+
+@dataclass
 class Config(Hashable):
     data_dir: Path
-    dataset_dir: Path
+    dataset_dir: Path | None
     desc_file: Path | None
 
     goal: str | None
@@ -117,8 +176,16 @@ class Config(Hashable):
 
     exec: ExecConfig
     agent: AgentConfig
+    post_search: PostSearchConfig
+    plan_constraints: PlanConstraintsConfig
+    per_step_grading: PerStepGradingConfig
     start_cpu_id: str
     cpu_number: str
+    competition_id: str | None = None
+    # Whether to delete any existing workspace dir for this exp_name before preparing input/working/submission.
+    reset_workspace: bool = True
+    # If true, load and continue from an existing journal under `log_dir/<exp_name>/journal.json`.
+    resume: bool = False
 
 
 def _get_next_logindex(dir: Path) -> int:
@@ -150,6 +217,11 @@ def prep_cfg(cfg: Config):
     if cfg.data_dir is None:
         raise ValueError("`data_dir` must be provided.")
 
+    # `dataset_dir` is only required for components that need access to MLE-Bench private data
+    # (e.g. `grading_server.py`). Keep it optional for standalone runs.
+    if getattr(cfg, "dataset_dir", None) is not None:
+        cfg.dataset_dir = Path(cfg.dataset_dir).resolve()
+
     if cfg.desc_file is None and cfg.goal is None:
         raise ValueError(
             "You must provide either a description of the task goal (`goal=...`) or a path to a plaintext file containing the description (`desc_file=...`)."
@@ -173,6 +245,10 @@ def prep_cfg(cfg: Config):
 
     cfg.log_dir = (top_log_dir / cfg.exp_name).resolve()
     cfg.workspace_dir = (top_workspace_dir / cfg.exp_name).resolve()
+
+    # Resume mode: keep the existing workspace directory if present.
+    if getattr(cfg, "resume", False):
+        cfg.reset_workspace = False
 
     # validate the config
     cfg_schema: Config = OmegaConf.structured(Config)
@@ -213,6 +289,9 @@ def load_task_desc(cfg: Config):
 
 def prep_agent_workspace(cfg: Config):
     """Setup the agent's workspace and preprocess data if necessary."""
+    if getattr(cfg, "reset_workspace", True) and cfg.workspace_dir.exists():
+        shutil.rmtree(cfg.workspace_dir)
+
     (cfg.workspace_dir / "input").mkdir(parents=True, exist_ok=True)
     (cfg.workspace_dir / "working").mkdir(parents=True, exist_ok=True)
     (cfg.workspace_dir / "submission").mkdir(parents=True, exist_ok=True)
@@ -225,12 +304,143 @@ def prep_agent_workspace(cfg: Config):
 def save_run(cfg: Config, journal: Journal):
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
-    # filtered_journal = filter_journal(journal)
-    # save journal
-    # serialize.dump_json(journal, cfg.log_dir / "journal.json")
-    # serialize.dump_json(filtered_journal, cfg.log_dir / "filtered_journal.json")
+    # Save journal for crash-resume support.
+    serialize.dump_json(journal, cfg.log_dir / "journal.json")
+    # Also save a JSONL view that is convenient for grepping / external tooling.
+    try:
+        with open(cfg.log_dir / "journal.jsonl", "w") as f:
+            for n in journal.nodes:
+                metric = getattr(n, "metric", None)
+                record = {
+                    "id": getattr(n, "id", None),
+                    "step": getattr(n, "step", None),
+                    "stage": getattr(n, "stage", None),
+                    "parent": getattr(getattr(n, "parent", None), "id", None),
+                    "children": sorted([c.id for c in getattr(n, "children", set())]),
+                    "is_buggy": getattr(n, "is_buggy", None),
+                    "is_valid": getattr(n, "is_valid", None),
+                    "metric": metric.to_dict() if metric is not None else None,
+                    "cv_mean": getattr(n, "cv_mean", None),
+                    "cv_std": getattr(n, "cv_std", None),
+                    "cv_folds": getattr(n, "cv_folds", None),
+                }
+                f.write(json.dumps(record, default=str) + "\n")
+    except Exception as e:
+        logger.warning(f"Failed to write journal.jsonl: {e}", exc_info=True)
     # save config
     OmegaConf.save(config=cfg, f=cfg.log_dir / "config_mcts.yaml")
+
+    # create/update the tree + code visualization (AIDE-like) for easier inspection during runs
+    try:
+        from utils.tree_export import generate as generate_tree_html
+
+        tree_path = cfg.log_dir / "tree_plot.html"
+        existed_before = tree_path.exists()
+        generate_tree_html(cfg, journal, tree_path)
+        if not existed_before and tree_path.exists():
+            logger.info(f"Tree visualization saved to: {tree_path}")
+    except Exception as e:
+        logger.warning(f"Failed to generate tree visualization HTML: {e}", exc_info=True)
+
+    # Export per-node artifacts (AIDE-like) for easier inspection/grading.
+    try:
+        solutions_dir = cfg.log_dir / "solutions"
+        solutions_dir.mkdir(parents=True, exist_ok=True)
+
+        # IMPORTANT: avoid O(steps^2) rewrites by only exporting NEW nodes.
+        state_path = solutions_dir / "export_state.json"
+        last_exported_idx = -1
+        try:
+            if state_path.exists():
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                last_exported_idx = int(state.get("last_exported_idx", -1))
+        except Exception:
+            last_exported_idx = -1
+
+        if last_exported_idx >= len(journal.nodes):
+            # Journal was reset/overwritten; start fresh.
+            last_exported_idx = -1
+
+        start_idx = max(0, last_exported_idx + 1)
+        append_rows: list[dict] = []
+
+        for idx in range(start_idx, len(journal.nodes)):
+            n = journal.nodes[idx]
+
+            # Save generated code once.
+            node_path = solutions_dir / f"node_{idx}.py"
+            if not node_path.exists():
+                node_path.write_text(
+                    getattr(n, "code", "") or "", encoding="utf-8", errors="replace"
+                )
+
+            # Copy per-node submission once (if it exists).
+            node_id = getattr(n, "id", None)
+            if node_id:
+                submission_src = cfg.workspace_dir / "submission" / f"submission_{node_id}.csv"
+                submission_dst = solutions_dir / f"submission_node_{idx}.csv"
+                if submission_src.is_file() and not submission_dst.exists():
+                    shutil.copy2(submission_src, submission_dst)
+
+            metric = getattr(n, "metric", None)
+            append_rows.append(
+                {
+                    "idx": idx,
+                    "id": node_id,
+                    "step": getattr(n, "step", None),
+                    "stage": getattr(n, "stage", None),
+                    "is_buggy": getattr(n, "is_buggy", None),
+                    "metric": getattr(metric, "value", None),
+                    "maximize": getattr(metric, "maximize", None),
+                    "cv_mean": getattr(n, "cv_mean", None),
+                    "cv_std": getattr(n, "cv_std", None),
+                }
+            )
+
+        if append_rows:
+            jsonl_path = solutions_dir / "metrics.jsonl"
+            jsonl_mode = "a" if start_idx > 0 and jsonl_path.exists() else "w"
+            with open(jsonl_path, jsonl_mode, encoding="utf-8") as f:
+                for row in append_rows:
+                    f.write(json.dumps(row, default=str) + "\n")
+
+            # Optional convenience export (AIDE produces both JSONL and CSV).
+            try:
+                import csv as _csv
+
+                fieldnames = [
+                    "idx",
+                    "id",
+                    "step",
+                    "stage",
+                    "is_buggy",
+                    "metric",
+                    "maximize",
+                    "cv_mean",
+                    "cv_std",
+                ]
+                csv_path = solutions_dir / "metrics.csv"
+                csv_mode = "a" if start_idx > 0 and csv_path.exists() else "w"
+                write_header = csv_mode == "w"
+                with open(csv_path, csv_mode, newline="", encoding="utf-8") as f:
+                    writer = _csv.DictWriter(f, fieldnames=fieldnames)
+                    if write_header:
+                        writer.writeheader()
+                    for row in append_rows:
+                        writer.writerow({k: row.get(k) for k in fieldnames})
+            except Exception:
+                pass
+
+        # Persist state for incremental exports (best-effort; not required for correctness).
+        try:
+            state_path.write_text(
+                json.dumps({"last_exported_idx": len(journal.nodes) - 1}),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning(f"Failed to export solutions/: {e}", exc_info=True)
     
     # save the best found solution
     best_node = journal.get_best_node()

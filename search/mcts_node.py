@@ -28,6 +28,14 @@ class MCTSNode(Node):
     expected_child_count: int = field(default=0, kw_only=True)
     finish_time: str = field(default=None, kw_only=True)
 
+    # Post-search selection: CV metrics (copied from AIDE)
+    cv_mean: Optional[float] = field(default=None, kw_only=True)
+    cv_std: Optional[float] = field(default=None, kw_only=True)
+    cv_folds: Optional[list[float]] = field(default=None, kw_only=True)
+    valid_metric: Optional[float] = field(default=None, kw_only=True)
+    train_metric: Optional[float] = field(default=None, kw_only=True)
+    test_metric: Optional[float] = field(default=None, kw_only=True)
+
 
     def __post_init__(self):
         super().__post_init__()

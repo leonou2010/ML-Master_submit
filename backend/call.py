@@ -1,7 +1,7 @@
 import logging
 
 from utils.llm_caller import LLM
-from backend.backend_utils import PromptType
+from backend.backend_utils import PromptType, opt_messages_to_list
 from utils.config_mcts import Config
 
 logger = logging.getLogger("ml-master")
@@ -23,20 +23,41 @@ def r1_query(
     if type(prompt) == str:
         logger.info(f"prompt: {prompt}", extra={"verbose": True})
     else:
-        logger.info(f"prompt: {prompt[0]['content']}\n{prompt[1]['content']}", extra={"verbose": True})
+        try:
+            if isinstance(prompt, (list, tuple)) and len(prompt) >= 2:
+                logger.info(f"prompt: {prompt[0].get('content', prompt[0])}\n{prompt[1].get('content', prompt[1])}", extra={"verbose": True})
+            else:
+                logger.info(f"prompt: {prompt}", extra={"verbose": True})
+        except (KeyError, TypeError, IndexError):
+            logger.info(f"prompt: {prompt}", extra={"verbose": True})
+    
+    # Ensure prompt is in the correct message list format
+    if isinstance(prompt, str):
+        messages = opt_messages_to_list(None, prompt)
+    elif isinstance(prompt, list) and len(prompt) > 0 and isinstance(prompt[0], dict) and "role" in prompt[0]:
+        # Already in correct format
+        messages = prompt
+    elif isinstance(prompt, list) and len(prompt) >= 2:
+        # Assume first element is system message, second is user message
+        messages = opt_messages_to_list(prompt[0] if isinstance(prompt[0], str) else str(prompt[0]), 
+                                       prompt[1] if isinstance(prompt[1], str) else str(prompt[1]))
+    else:
+        # Fallback: treat as user message
+        messages = opt_messages_to_list(None, str(prompt))
+    
     model_kwargs = model_kwargs | {
         "temperature": temperature,
         "max_tokens": max_tokens
     }
     if cfg.agent.steerable_reasoning == True:
         response = llm.stream_complete(
-            prompt,
+            messages,
             **model_kwargs
         )
         
     else:
         response = llm.stream_generate(
-            prompt,
+            messages,
             **model_kwargs
         )
 
@@ -68,14 +89,35 @@ def gpt_query(
     if type(prompt) == str:
         logger.info(f"prompt: {prompt}", extra={"verbose": True})
     else:
-        logger.info(f"prompt: {prompt[0]['content']}\n{prompt[1]['content']}", extra={"verbose": True})
+        try:
+            if isinstance(prompt, (list, tuple)) and len(prompt) >= 2:
+                logger.info(f"prompt: {prompt[0].get('content', prompt[0])}\n{prompt[1].get('content', prompt[1])}", extra={"verbose": True})
+            else:
+                logger.info(f"prompt: {prompt}", extra={"verbose": True})
+        except (KeyError, TypeError, IndexError):
+            logger.info(f"prompt: {prompt}", extra={"verbose": True})
+    
+    # Ensure prompt is in the correct message list format
+    if isinstance(prompt, str):
+        messages = opt_messages_to_list(None, prompt)
+    elif isinstance(prompt, list) and len(prompt) > 0 and isinstance(prompt[0], dict) and "role" in prompt[0]:
+        # Already in correct format
+        messages = prompt
+    elif isinstance(prompt, list) and len(prompt) >= 2:
+        # Assume first element is system message, second is user message
+        messages = opt_messages_to_list(prompt[0] if isinstance(prompt[0], str) else str(prompt[0]), 
+                                       prompt[1] if isinstance(prompt[1], str) else str(prompt[1]))
+    else:
+        # Fallback: treat as user message
+        messages = opt_messages_to_list(None, str(prompt))
+    
     model_kwargs = model_kwargs | {
         "temperature": temperature,
         "max_tokens": max_tokens
     }
 
     response = llm.stream_generate(
-        prompt,
+        messages,
         **model_kwargs
     )
 

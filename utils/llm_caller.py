@@ -47,6 +47,19 @@ class LLM:
             api_key=self.api_key,
             base_url=self.base_url
         )
+
+    def _supports_vllm_extra_body(self) -> bool:
+        """
+        vLLM-specific request fields (e.g. `chat_template_kwargs`) are not accepted by the
+        official OpenAI API and can cause 400s. Only attach them for self-hosted / compatible
+        endpoints.
+        """
+        base_url = (self.base_url or "").lower()
+        if "api.openai.com" in base_url:
+            return False
+        if "openai.azure.com" in base_url:
+            return False
+        return True
     
     def generate(
         self, 
@@ -83,14 +96,21 @@ class LLM:
             "model": self.model_name,
             "messages": messages,
             "temperature": temp,
-            "max_tokens": tokens,
             "stream": stream,
-            "extra_body": {
-    "chat_template_kwargs": {"thinking": True},
-    "separate_reasoning": True
-},
             **kwargs
         }
+        
+        # Handle max_tokens vs max_completion_tokens based on model
+        if self.model_name == "o4-mini":
+            params["max_completion_tokens"] = tokens
+        else:
+            params["max_tokens"] = tokens
+
+        if self._supports_vllm_extra_body():
+            params["extra_body"] = {
+                "chat_template_kwargs": {"thinking": True},
+                "separate_reasoning": True,
+            }
         
         # add stop_tokens
         if stops is not None:
@@ -154,14 +174,21 @@ class LLM:
             "model": self.model_name,
             "messages": messages,
             "temperature": temp,
-            "max_tokens": tokens,
             "stream": stream,
-            "extra_body": {
-    "chat_template_kwargs": {"thinking": True},
-    "separate_reasoning": True
-},
             **kwargs
         }
+        
+        # Handle max_tokens vs max_completion_tokens based on model
+        if self.model_name == "o4-mini":
+            params["max_completion_tokens"] = tokens
+        else:
+            params["max_tokens"] = tokens
+
+        if self._supports_vllm_extra_body():
+            params["extra_body"] = {
+                "chat_template_kwargs": {"thinking": True},
+                "separate_reasoning": True,
+            }
         
         # add stop_tokens
         if stops is not None:
@@ -235,10 +262,15 @@ class LLM:
             "model": self.model_name,
             "prompt": prompt,
             "temperature": temp,
-            "max_tokens": tokens,
             "stream": stream,
             **kwargs
         }
+        
+        # Handle max_tokens vs max_completion_tokens based on model
+        if self.model_name == "o4-mini":
+            params["max_completion_tokens"] = tokens
+        else:
+            params["max_tokens"] = tokens
         
         # add stop_tokens
         if stops is not None:
@@ -285,10 +317,15 @@ class LLM:
             "model": self.model_name,
             "prompt": prompt,
             "temperature": temp,
-            "max_tokens": tokens,
             "stream": stream,
             **kwargs
         }
+        
+        # Handle max_tokens vs max_completion_tokens based on model
+        if self.model_name == "o4-mini":
+            params["max_completion_tokens"] = tokens
+        else:
+            params["max_tokens"] = tokens
         
         # add stop_tokens
         if stops is not None:

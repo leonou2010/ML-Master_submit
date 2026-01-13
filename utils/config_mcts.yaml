@@ -17,6 +17,10 @@ preprocess_data: True
 # whether to copy the data to the workspace directory (otherwise it will be symlinked)
 # copying is recommended to prevent the agent from accidentally modifying the original data
 copy_data: False
+# delete existing workspace dir for this `exp_name` before preparing input/working/submission
+reset_workspace: true
+# If true, resume from an existing `journal.json` under `log_dir/exp_name/` (if present).
+resume: false
 
 exp_name: null # a random experiment name will be generated if not provided
 
@@ -75,6 +79,15 @@ agent:
     metric_improvement_threshold: 0.0001
     max_improve_failure: 3
     parallel_search_num: 3
+    # Bug consultant (RAG + RL + Summarization debugging) - copied from AIDE
+    use_bug_consultant: false  # Set to true to enable bug consultant
+    max_bug_records: 500  # Maximum number of bug records to keep in memory
+    advice_budget_chars: 200000  # Character budget for advice retrieval
+    max_active_bugs: 200  # Maximum number of active bugs to track
+    max_trials_per_bug: 20  # Maximum debug trials per bug
+    delete_pruned_bug_files: false  # Delete bug files when pruning old records
+    bug_context_mode: consultant  # consultant | buggy_code | both
+    bug_context_count: 0  # Number of buggy nodes to include as context (0 = disabled)
   
   decay:
     decay_type: piecewise       # decay_type
@@ -90,8 +103,40 @@ agent:
     dynamic_piecewise_decay:
       alpha: 0.01
       phase_ratios: [0.85, 1]
-    
 
+# Post-search selection (copied from AIDE for A/B testing)
+post_search:
+  selection: best_valid  # Options: best_valid | maximin | elite_maximin | mean_minus_k_std | maximin_no_filter
+  top_k: 20  # Consider top K nodes by cv_mean/valid_metric
+  k_std: 2.0  # For mean_minus_k_std: cv_mean - k*cv_std
+  z_threshold: 2.0  # (unused, kept for compatibility)
+  guard_std: 2.0  # (unused, kept for compatibility)
+  elite_top_k: 3  # For elite_maximin: minimum elite set size
+  elite_ratio: 0.05  # For elite_maximin: take top 5% as elite
+  elite_k_std: 2.0  # For elite_maximin: best_cv_mean ± k*std filter
 
+# Prompt-only plan/sketch constraints (copied from AIDE for A/B testing)
+# Note: we do NOT truncate/regenerate based on these values; the agent only changes prompt instructions
+plan_constraints:
+  enabled: false  # Set to true to enforce plan length constraints
+  max_sentences: 5  # Maximum number of sentences in plan/sketch
 
+# Per-step grading configuration (for generalization gap experiments)
+per_step_grading:
+  enabled: false  # Set to true for ultrathink experiments
+  mlebench_data_dir: /home/ka3094/mle-bench/data/competitions
+  methods:
+    - best_valid
+    - mean_minus_k_std
+    - maximin
+    - elite_maximin
+  grade_every_n_steps: 1  # Grade every N steps (1 = grade at every step)
+  save_every_n_steps: 1  # Save CSV/JSON every N steps for live monitoring
 
+# Optional: MLE-bench competition ID (for per-step grading)
+competition_id: null
+
+# CPU affinity settings for the execution subprocesses.
+# These are required by `interpreter/interpreter_parallel.py` (it sets `os.sched_setaffinity`).
+start_cpu_id: "0"
+cpu_number: "4"

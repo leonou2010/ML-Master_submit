@@ -5,7 +5,7 @@ import random
 logger = logging.getLogger("ml-master")
 
 server_url_list = [
-"http://127.0.0.1:5001",
+"http://127.0.0.1:5000",  # Changed from 5001 to 5000 for MLE-bench compatibility
 ]
 
 
@@ -48,14 +48,22 @@ def call_validate(exp_id, submission_path, timeout=60, max_retries=3):
         try:
             if online:
                 files = {"file": open(submission_path, "rb")}
-                response = requests.post(f"{server_url}/validate", files = files,headers = {"exp-id": exp_id}, timeout=timeout)
+                # MLE-bench doesn't use exp-id header, so we don't send it
+                response = requests.post(f"{server_url}/validate", files = files, timeout=timeout)
                 print(response)
                 response_json = response.json()
                 if "error" in response_json:
                     logger.error(f"Server returned error: {response.text}")
                     return False, response_json['details']
                 else:
-                    return True, response_json
+                    # Adapt MLE-bench response format to ML-Master's expected format
+                    # MLE-bench returns {"result": "Submission is valid."} or {"result": "<error message>"}
+                    result_message = response_json.get("result", "")
+                    adapted_response = {
+                        "is_valid": (result_message == "Submission is valid."),
+                        "result": result_message,
+                    }
+                    return True, adapted_response
             else:
                 return False, f"Server at {server_url} is not online"
         except requests.exceptions.Timeout:

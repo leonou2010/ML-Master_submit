@@ -3,6 +3,7 @@ import logging
 import random
 import os
 import time
+import re
 from typing import Any, Callable, cast, Tuple, List, Literal
 import math
 import humanize
@@ -16,7 +17,9 @@ from utils.metric import MetricValue, WorstMetricValue
 from utils.response import extract_code, extract_text_up_to_code, wrap_code, extract_review
 from utils.server_utils import call_validate
 from utils.mcts import linear_decay, exponential_decay, piecewise_decay, dynamic_piecewise_decay
+from utils.metrics_io import parse_aide_metrics, normalize_metrics
 import threading
+import numpy as np
 
 logger = logging.getLogger("ml-master")
 
@@ -58,6 +61,11 @@ review_func_spec = FunctionSpec(
                 "type": "boolean",
                 "description": "true if the metric should be minimized (i.e. a lower metric value is better, such as with MSE), false if the metric should be maximized (i.e. a higher metric value is better, such as with accuracy).",
             },
+            "cv_folds": {
+                "type": "array",
+                "items": {"type": "number"},
+                "description": "If cross-validation was used, report all individual fold scores as a list. Otherwise, leave it null.",
+            },
         },
         "required": [
             "is_bug",
@@ -84,19 +92,96 @@ class MCTSAgent:
         self.scfg = cfg.agent.search
         self.journal = journal
         self.data_preview: str | None = None
-        self.current_step = 0
+        self.current_step = len(self.journal)
         self.current_node: MCTSNode | None = None
         self.all_root = True
-        self.virtual_root = MCTSNode(parent=None, plan="virtual plan", code="# virtual code", metric=WorstMetricValue(), stage="root")
         self.current_node_list = []
-        self.journal.append(self.virtual_root)
+
+        if len(self.journal) == 0:
+            # New run: create the virtual root node.
+            self.virtual_root = MCTSNode(
+                parent=None,
+                plan="virtual plan",
+                code="# virtual code",
+                metric=WorstMetricValue(),
+                stage="root",
+            )
+            self.journal.append(self.virtual_root)
+            self.current_step = len(self.journal)
+        else:
+            # Resume run: journal already has the virtual root at index 0.
+            self.virtual_root = cast(MCTSNode, self.journal.nodes[0])
+
         self.best_metric: float = None
         self.best_node: MCTSNode = None
-        self.search_start_time = None
+        # Ensure this is set in resume mode (some decay schedules depend on it).
+        self.search_start_time = time.time()
         self.journal_lock = threading.Lock()
         self.save_node_lock = threading.Lock()
         self.start_time = time.time()
-        
+
+        # Resume support: restore best-so-far from existing journal state.
+        if len(self.journal) > 1:
+            best: MCTSNode | None = None
+            for node in self.journal.nodes[1:]:
+                if getattr(node, "metric", None) is None or node.metric.value is None:
+                    continue
+                if best is None or best.metric < node.metric:
+                    best = cast(MCTSNode, node)
+            if best is not None:
+                self.best_node = best
+                self.best_metric = best.metric.value
+
+        # Bug consultant (RAG + RL + Summarization debugging) - copied from AIDE
+        self.bug_consultant = None
+        if getattr(self.scfg, "use_bug_consultant", False):
+            from utils.bug_consultant import BugConsultant
+            save_dir = (self.cfg.log_dir / "bug_consultant").resolve()
+            self.bug_consultant = BugConsultant(
+                model=self.acfg.feedback.model,
+                temperature=0.3,
+                save_dir=save_dir,
+                max_bug_records=int(getattr(self.scfg, "max_bug_records", 500) or 500),
+                advice_budget_chars=int(getattr(self.scfg, "advice_budget_chars", 200000) or 200000),
+                max_active_bugs=int(getattr(self.scfg, "max_active_bugs", 200) or 200),
+                max_trials_per_bug=int(getattr(self.scfg, "max_trials_per_bug", 20) or 20),
+                delete_pruned_bug_files=bool(getattr(self.scfg, "delete_pruned_bug_files", False)),
+            )
+            # Resume support: rebuild memory from existing journal
+            if self.journal.nodes:
+                self.bug_consultant.ingest_journal(self.journal)
+
+    def _format_bug_node_for_memory(self, node: MCTSNode) -> str:
+        lines = [f"**Node #{node.step}**"]
+        if node.plan:
+            lines.append(f"Plan: {node.plan}")
+        if node.exc_type:
+            lines.append(f"Error: {node.exc_type}")
+        if node.code:
+            lines.append(f"Code:\n```python\n{node.code}\n```")
+        out = node.term_out
+        if out:
+            lines.append(f"Output:\n```\n{out}\n```")
+        return "\n\n".join(lines)
+
+    def _buggy_nodes_for_memory(self, *, exclude_step: int | None = None) -> list[str]:
+        """
+        Return formatted buggy nodes for prompt memory.
+        Controlled by: agent.search.bug_context_count.
+        """
+        count = int(getattr(self.scfg, "bug_context_count", 0) or 0)
+        if count == 0:
+            return []
+
+        with self.journal_lock:
+            buggy_nodes = [n for n in self.journal.buggy_nodes if n.step is not None]
+            buggy_nodes = sorted(buggy_nodes, key=lambda n: n.step)
+            if exclude_step is not None:
+                buggy_nodes = [n for n in buggy_nodes if n.step != exclude_step]
+            buggy_nodes = buggy_nodes[-count:]
+
+        return [self._format_bug_node_for_memory(n) for n in buggy_nodes]
+
     @property
     def _prompt_environment(self):
         pkgs = [
@@ -138,11 +223,14 @@ class MCTSAgent:
             "No parts of the code should be skipped, don't terminate the before finishing the script.",
             "Your response should only contain a single code block.",
             f"Be aware of the running time of the code, it should complete within {humanize.naturaldelta(exec_timeout)}.",
+            "DO NOT use GridSearchCV or RandomizedSearchCV.",
+            "Compute safety: avoid unconstrained parallelism. Do NOT use `n_jobs=-1`. If you set `n_jobs` / `thread_count` / `num_threads` / `nthread`, cap them to `int(os.getenv('MLMASTER_NUM_THREADS', '4'))` (use the same cap consistently). For PyTorch `DataLoader`, set `num_workers=min(4, int(os.getenv('MLMASTER_NUM_THREADS', '4')))`.",
             'All the provided input data is stored in "./input" directory.',
             '**You MUST submit predictions on the provided unlabeled test data in a `submission.csv` file** file in the "./working" directory as described in the task description** This is extremely important since this file is used for grading/evaluation. DO NOT FORGET THE submission.csv file!',
             'You can also use the "./working" directory to store any temporary files that your code needs to create.',
+            "**CRITICAL - Data Leakage Prevention**: NEVER use target encoding or create features using the target variable (e.g., target mean encoding, target-based statistics, label encoding with target information). This causes severe data leakage and inflates validation scores artificially. Any feature engineering must use only the input features, never the target.",
             "REMEMBER THE ./submission/submission.csv FILE!!!!! The correct directory is important too.",
-            "If you use `DataLoader`, you need to increase the parameter `num_workers` to speed up the training process."
+            "At the end of the script, print a single-line JSON with prefix `AIDE_METRICS_JSON=` so the harness can parse metrics. Include: `valid`, `lower_is_better`, and (for CV) `cv_mean`, `cv_std`, `cv_folds` (list of fold scores).",
         ]
         if self.acfg.expose_prediction:
             impl_guideline.append(
@@ -153,23 +241,112 @@ class MCTSAgent:
 
         if self.acfg.k_fold_validation > 1:
             impl_guideline.append(
-                f"The evaluation should be based on {self.acfg.k_fold_validation}-fold cross-validation but only if that's an appropriate evaluation for the task at hand."
+                f"**MANDATORY - Cross-Validation**: Use {self.acfg.k_fold_validation}-fold cross-validation for evaluation. Report ALL fold scores in cv_folds (not just mean/std). The cv_folds list is required for robust model selection."
             )
 
         return {"Implementation guideline": impl_guideline}
+
+    def _debug_subsample_guideline(self) -> str:
+        """Instructional text: allow subsampling only for debug runs."""
+        frac = float(getattr(self.scfg, "debug_data_fraction", 0.1))
+        # Keep within sensible bounds to avoid empty/huge subsamples.
+        frac = min(max(frac, 0.01), 1.0)
+        pct = int(round(frac * 100))
+        return (
+            f"**FOR QUICK DEBUGGING**: Subsample the training data to approximately {pct}% "
+            f"({frac:.2f} fraction) near the beginning of your code to speed up debugging. "
+            "Add a clear comment like `# DEBUG: Using subsample for fast iteration` so it can be removed once the bug is fixed."
+        )
+
+    @staticmethod
+    def _has_debug_subsampling(code: str) -> bool:
+        patterns = [
+            r"\.sample\s*\(",
+            r"\bfrac\s*=",
+            r"\bnrows\s*=",
+            r"\bhead\s*\(",
+            r"DEBUG:.*subsample",
+            r"DEBUG:.*sample",
+            r"#\s*DEBUG",
+        ]
+        return any(re.search(pat, code, flags=re.IGNORECASE) for pat in patterns)
+
+    def _strip_debug_subsampling(self, code: str) -> str | None:
+        prompt = {
+            "Instruction": (
+                "You are cleaning debug code. Remove any debug subsampling, sampling fractions, "
+                "nrows/head truncations, or DEBUG placeholders. Preserve all other logic, comments, "
+                "and structure. Return ONLY the cleaned Python code in a single markdown code block."
+            ),
+            "Code": wrap_code(code),
+        }
+        try:
+            completion = cast(
+                str,
+                query(
+                    system_message=prompt,
+                    user_message=None,
+                    model=self.acfg.code.model,
+                    temperature=0.0,
+                    convert_system_to_user=self.acfg.convert_system_to_user,
+                    cfg=self.cfg,
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to strip debug subsampling via LLM: {e}")
+            return None
+
+        cleaned = extract_code(completion)
+        if not cleaned:
+            logger.warning("Failed to extract cleaned code block while stripping debug subsampling.")
+            return None
+        return cleaned
     
     @property
     def _prompt_resp_fmt(self):
+        # Add plan constraints if enabled (copied from AIDE)
+        constraint_bits: list[str] = []
+        plan_cfg = getattr(self.cfg, "plan_constraints", None)
+        if plan_cfg is not None and getattr(plan_cfg, "enabled", False):
+            max_sentences = getattr(plan_cfg, "max_sentences", None)
+            if max_sentences is not None:
+                constraint_bits.append(f"≤{int(max_sentences)} sentences")
+        constraint_part = f" ({'; '.join(constraint_bits)})" if constraint_bits else ""
+
         return {
             "Response format": (
-                "Your response should be a brief outline/sketch of your proposed solution in natural language (3-5 sentences), "
+                f"Your response should be a brief outline/sketch of your proposed solution in natural language{constraint_part}, "
                 "followed by a single markdown code block (wrapped in ```) which implements this solution and prints out the evaluation metric. "
                 "There should be no additional headings or text in your response. Just natural language text followed by a newline and then the markdown code block. "
             )
         }
+
+    def _solution_sketch_length_guideline(self) -> str | None:
+        """Generate guideline text for solution sketch length constraints."""
+        plan_cfg = getattr(self.cfg, "plan_constraints", None)
+        if plan_cfg is None or not getattr(plan_cfg, "enabled", False):
+            return None
+
+        max_sentences = getattr(plan_cfg, "max_sentences", None)
+        parts: list[str] = []
+        if max_sentences is not None:
+            parts.append(f"at most {int(max_sentences)} sentences")
+        if not parts:
+            return None
+        return f"The solution sketch should be {', '.join(parts)}."
     
     def _draft(self) -> MCTSNode:
         logger.info("Starting Drafting a new Node.")
+        # Bug consultant prevention guidance (copied from AIDE)
+        exec_summary = ""
+        bug_context_mode = str(getattr(self.scfg, "bug_context_mode", "consultant"))
+        if self.bug_consultant and bug_context_mode in ("consultant", "both"):
+            try:
+                exec_summary = self.bug_consultant.get_prevention_guidance(mode="executive")
+            except Exception as e:
+                logger.warning(f"Failed to get bug prevention guidance: {e}")
+                exec_summary = ""
+
         introduction = (
             "You are a Kaggle grandmaster attending a competition. "
             "In order to win this competition, you need to come up with an excellent and creative plan "
@@ -188,29 +365,34 @@ class MCTSAgent:
             "Instructions": {},
         }
         prompt["Instructions"] |= self._prompt_resp_fmt
-        prompt["Instructions"] |= {
-            "Solution sketch guideline": [
-                "- This first solution design should be relatively simple, without ensembling or hyper-parameter optimization.\n",
-                "- When proposing the design, take the Memory section into account.\n",
-                "- In addition to incorporating the Memory module, it is **crucial** that your proposed solution **is distinctly different from** the existing designs in the Memory section.\n",
-                "- Don't propose the same modelling solution but keep the evaluation the same.\n",
-                "- The solution sketch should be 3-5 sentences.\n",
-                "- Propose an evaluation metric that is reasonable for this task.\n",
-                "- Don't suggest to do EDA.\n",
-                "- The data is already prepared and available in the `./input` directory. There is no need to unzip any files.\n",
-            ],
-        }
+        draft_guideline = [
+            "- This first solution design should be relatively simple, without ensembling or hyper-parameter optimization.\n",
+            "- When proposing the design, take the Memory section into account.\n",
+            "- In addition to incorporating the Memory module, it is **crucial** that your proposed solution **is distinctly different from** the existing designs in the Memory section.\n",
+            "- Don't propose the same modelling solution but keep the evaluation the same.\n",
+            "- Do not subsample the dataset in draft runs; always use the full training data.\n",
+            "- The solution sketch should be 3-5 sentences.\n",
+            "- Propose an evaluation metric that is reasonable for this task.\n",
+            "- Don't suggest to do EDA.\n",
+            "- The data is already prepared and available in the `./input` directory. There is no need to unzip any files.\n",
+        ]
+        # Add plan length constraint if enabled (copied from AIDE)
+        length_guideline = self._solution_sketch_length_guideline()
+        if length_guideline:
+            draft_guideline.insert(4, length_guideline)
+        prompt["Instructions"] |= {"Solution sketch guideline": draft_guideline}
         prompt["Instructions"] |= self._prompt_impl_guideline
         prompt["Instructions"] |= self._prompt_environment
 
         instructions = f"\n# Instructions\n\n"
         instructions += compile_prompt_to_md(prompt["Instructions"], 2)
+        bug_prevention_section = f"\n# Bug Prevention Alert\n{exec_summary}\n" if exec_summary else ""
 
         if "qwen3" in self.acfg.code.model and self.acfg.steerable_reasoning== True:
-            user_prompt = f"\n# Task description\n{prompt['Task description']}\n\n# Memory\nThe memory of previous solutions used to solve task is provided below:\n {prompt['Memory']}\n\n{instructions}"
+            user_prompt = f"\n# Task description\n{prompt['Task description']}\n\n# Memory\nThe memory of previous solutions used to solve task is provided below:\n {prompt['Memory']}\n{bug_prevention_section}\n{instructions}"
             prompt_complete = f"<|im_start|>system\n{introduction}<|im_end|>\n<|im_start|>user{user_prompt}<|im_end|><|im_start|>assistant\n<think>Okay! Now, I will focus my efforts on successfully completing this current task.\nBefore completing this task, first of all, I need to analyze and understand the relevant dataset. The information of the dataset is as follows: \n{self.data_preview}"
         elif "deepseek" in self.acfg.code.model and self.acfg.steerable_reasoning== True:
-            user_prompt = f"\n# Task description\n{prompt['Task description']}\n\n# Memory\nThe memory of previous solutions used to solve task is provided below:\n{prompt['Memory']}\n\n{instructions}"
+            user_prompt = f"\n# Task description\n{prompt['Task description']}\n\n# Memory\nThe memory of previous solutions used to solve task is provided below:\n{prompt['Memory']}\n{bug_prevention_section}\n{instructions}"
             prompt_complete = f"<｜begin▁of▁sentence｜>\n{introduction}\n<｜User｜>{user_prompt}<｜Assistant｜><think>\nOkay! Now, I will focus my efforts on successfully completing this current task.\nBefore completing this task, first of all, I need to analyze and understand the relevant dataset. The information of the dataset is as follows: \n{self.data_preview}"
         elif "gpt-5" in self.acfg.code.model or self.acfg.steerable_reasoning == False:
             user_prompt = f"""
@@ -220,6 +402,7 @@ class MCTSAgent:
 # Memory
 The memory of previous solutions used to solve task is provided below:
 {prompt['Memory']}
+{bug_prevention_section}
 
 {instructions}
 
@@ -262,17 +445,21 @@ The memory of previous solutions used to solve task is provided below:
         }
 
         prompt["Instructions"] |= self._prompt_resp_fmt
-        prompt["Instructions"] |= {
-            "Solution improvement sketch guideline": [
-                "- The solution sketch should be a brief natural language description of how the previous solution can be improved.\n",
-                "- You should be very specific and should only propose a single actionable improvement.\n",
-                "- This improvement should be atomic so that we can experimentally evaluate the effect of the proposed change.\n",
-                "- When proposing the design, take the Memory section into account.\n",
-                "- In addition to incorporating the Memory module, it is **crucial** that your proposed solution **is distinctly different from** the existing designs in the Memory section.\n",
-                "- The solution sketch should be 3-5 sentences.\n",
-                "- Don't suggest to do EDA.\n",
-            ],
-        }
+        improve_guideline = [
+            "- The solution sketch should be a brief natural language description of how the previous solution can be improved.\n",
+            "- You should be very specific and should only propose a single actionable improvement.\n",
+            "- This improvement should be atomic so that we can experimentally evaluate the effect of the proposed change.\n",
+            "- When proposing the design, take the Memory section into account.\n",
+            "- In addition to incorporating the Memory module, it is **crucial** that your proposed solution **is distinctly different from** the existing designs in the Memory section.\n",
+            "- If there is any debug subsampling code in the previous solution (e.g., data sampling, `frac=...`, `nrows=...`, `head(...)`, `# DEBUG`), remove it and use the full dataset.\n",
+            "- The solution sketch should be 3-5 sentences.\n",
+            "- Don't suggest to do EDA.\n",
+        ]
+        # Add plan length constraint if enabled (copied from AIDE)
+        length_guideline = self._solution_sketch_length_guideline()
+        if length_guideline:
+            improve_guideline.insert(4, length_guideline)
+        prompt["Instructions"] |= {"Solution improvement sketch guideline": improve_guideline}
         prompt["Instructions"] |= self._prompt_impl_guideline
         output = wrap_code(parent_node.term_out, lang="")
         
@@ -317,6 +504,58 @@ The memory of previous solutions used to improve performance is provided below:
 
     def _debug(self, parent_node: MCTSNode) -> MCTSNode:
         logger.info(f"Starting Debugging Node {parent_node.id}.")
+
+        # Bug consultant integration (copied from AIDE)
+        exec_summary = ""
+        debug_history = ""
+        active_trials = ""
+        bug_context_mode = str(getattr(self.scfg, "bug_context_mode", "consultant"))
+
+        if self.bug_consultant:
+            try:
+                exec_summary = self.bug_consultant.get_prevention_guidance(mode="executive")
+            except Exception as e:
+                logger.warning(f"Failed to get bug prevention guidance: {e}")
+                exec_summary = ""
+
+            try:
+                # Use full output (not truncated) for better bug matching
+                full_error_msg = "".join(parent_node._term_out) if hasattr(parent_node, "_term_out") else parent_node.term_out
+                retrieval = self.bug_consultant.retrieve_relevant_context(
+                    current_error_type=parent_node.exc_type or "Unknown",
+                    current_error_msg=full_error_msg,
+                    current_code=parent_node.code,
+                    original_plan=parent_node.plan or "",
+                )
+                debug_history = self.bug_consultant.format_context_for_actor(retrieval)
+            except Exception as e:
+                logger.warning(f"Failed to retrieve bug context: {e}")
+                debug_history = ""
+
+            try:
+                active_trials = self.bug_consultant.format_active_trial_history(
+                    f"bug_{parent_node.step}", max_trials=5
+                )
+            except Exception as e:
+                logger.warning(f"Failed to get active trial history: {e}")
+                active_trials = ""
+
+        past_buggy_nodes = []
+        if bug_context_mode in ("buggy_code", "both"):
+            past_buggy_nodes = self._buggy_nodes_for_memory(exclude_step=parent_node.step)
+
+        bug_context_sections = ""
+        if parent_node.plan:
+            bug_context_sections += f"\n# Approved Solution Plan\n{parent_node.plan}\n"
+        if exec_summary and bug_context_mode in ("consultant", "both"):
+            bug_context_sections += f"\n# Bug Prevention Alert\n{exec_summary}\n"
+        if debug_history and bug_context_mode in ("consultant", "both"):
+            bug_context_sections += f"\n# Historical Bug Context (Curated)\n{debug_history}\n"
+        if active_trials:
+            bug_context_sections += f"\n# Current Bug Trial History\n{active_trials}\n"
+        if past_buggy_nodes:
+            bug_context_sections += "\n# Past buggy nodes (raw)\n" + "\n\n".join(past_buggy_nodes) + "\n"
+
         introduction = (
             "You are a Kaggle grandmaster attending a competition. "
             "Your previous solution had a bug and/or did not produce a submission.csv, "
@@ -344,15 +583,27 @@ The memory of previous solutions used to improve performance is provided below:
         prompt: Any = {
             "Introduction": introduction,
             "Task description": self.task_desc,
+            "Approved Solution Plan": parent_node.plan or "",
             "Previous (buggy) implementation": wrap_code(parent_node.code),
             "Execution output": wrap_code(parent_node.term_out, lang=""),
             "Instructions": {},
         }
+
         prompt["Instructions"] |= self._prompt_resp_fmt
+        bugfix_guideline = [
+            "- You should write a brief natural language description (3-5 sentences) of how the issue in the previous implementation can be fixed.\n",
+            f"- {self._debug_subsample_guideline()}\n",
+            "- Don't suggest to do EDA.\n",
+        ]
+        # Add plan length constraint if enabled (copied from AIDE)
+        length_guideline = self._solution_sketch_length_guideline()
+        if length_guideline:
+            bugfix_guideline.insert(1, length_guideline)
+        prompt["Instructions"] |= {"Bugfix improvement sketch guideline": bugfix_guideline}
         prompt["Instructions"] |= {
-            "Bugfix improvement sketch guideline": [
-                "- You should write a brief natural language description (3-5 sentences) of how the issue in the previous implementation can be fixed.\n",
-                "- Don't suggest to do EDA.\n",
+            "Plan adherence": [
+                "Honor the Approved Solution Plan above; fix the bug without changing the planned approach unless absolutely necessary.",
+                "Do not add or delete planned features/models/training strategies; focus on the minimal fix.",
             ],
         }
         prompt["Instructions"] |= self._prompt_impl_guideline
@@ -361,15 +612,17 @@ The memory of previous solutions used to improve performance is provided below:
         instructions += compile_prompt_to_md(prompt["Instructions"], 2)
 
         if "qwen3" in self.acfg.code.model and self.acfg.steerable_reasoning== True:
-            qwen3_user_prompt = f"\n# Task description\n{prompt['Task description']}\n{instructions}"
+            qwen3_user_prompt = f"\n# Task description\n{prompt['Task description']}\n{bug_context_sections}\n{instructions}"
             prompt_complete = f"<|im_start|>system\n{introduction}<|im_end|>\n<|im_start|>user{qwen3_user_prompt}<|im_end|><|im_start|>assistant\n<think>Okay! Now, I will focus my efforts on successfully completing this current task.\nBefore completing this task, first of all, I need to analyze and understand the relevant dataset. The information of the dataset is as follows: \n{self.data_preview}\nRegarding this task, I previously made an attempt with the following code:\n{prompt['Previous (buggy) implementation']}\nHowever, there are the following issues with this code:\n{prompt['Execution output']}\nI hold the view that the underlying reasons giving rise to the emergence of this issue are:\n{parent_node.analysis}\nThe previous solution had a bug and/or did not produce a submission.csv. I will try to fix the bug."
         elif "deepseek" in self.acfg.code.model and self.acfg.steerable_reasoning== True:
-            user_prompt = f"\n# Task description\n{prompt['Task description']}\n{instructions}"
+            user_prompt = f"\n# Task description\n{prompt['Task description']}\n{bug_context_sections}\n{instructions}"
             prompt_complete = f"<｜begin▁of▁sentence｜>{prompt['Introduction']}<｜User｜>{user_prompt}<｜Assistant｜><think>\nOkay! Now, I will focus my efforts on successfully completing this current task.\nBefore completing this task, first of all, I need to analyze and understand the relevant dataset. The information of the dataset is as follows: \n{self.data_preview}\nRegarding this task, I previously made an attempt with the following code:\n{prompt['Previous (buggy) implementation']}\nHowever, there are the following issues with this code:\n{prompt['Execution output']}\nI hold the view that the underlying reasons giving rise to the emergence of this issue are:\n{parent_node.analysis}\nThe previous solution had a bug and/or did not produce a submission.csv, or the generated submission.csv was in an incorrect format.I will try to fix the bug."
         elif "gpt-5" in self.acfg.code.model or self.acfg.steerable_reasoning == False:
             user_prompt = f"""
 # Task description
 {prompt['Task description']}
+
+{bug_context_sections}
 
 {instructions}
 
@@ -482,9 +735,26 @@ The memory of previous solutions used to improve performance is provided below:
                 ),
             )
 
-            # if the metric isn't a float then fill the metric with the worst metric
-            if not isinstance(response["metric"], float):
+            # Prefer structured metrics printed by the runfile when available.
+            # Use FULL output for JSON parsing (not truncated) to avoid cutting JSON line mid-string.
+            full_term_out = "".join(node._term_out)
+            parsed = parse_aide_metrics(full_term_out)
+            norm = normalize_metrics(parsed) if parsed is not None else None
+            if norm is not None:
+                valid = norm.get("valid")
+                if isinstance(valid, (int, float)) and not isinstance(valid, bool):
+                    response["metric"] = float(valid)
+                lower_is_better = norm.get("lower_is_better")
+                if isinstance(lower_is_better, bool):
+                    response["lower_is_better"] = lower_is_better
+
+            # Coerce metric to float, otherwise treat as missing.
+            metric = response.get("metric")
+            if isinstance(metric, bool) or not isinstance(metric, (int, float)):
                 response["metric"] = None
+            else:
+                metric_f = float(metric)
+                response["metric"] = metric_f if math.isfinite(metric_f) else None
 
             # do an extra check, to catch cases where judge fails
             has_csv_submission = (
@@ -492,6 +762,110 @@ The memory of previous solutions used to improve performance is provided below:
             ).exists()
 
             node.analysis = response["summary"]
+
+            # ---- CV metrics parsing (copied from AIDE) ----
+            # Always store the reviewer-reported validation metric as a default
+            node.valid_metric = response["metric"] if isinstance(response["metric"], float) else None
+
+            # Two-layer approach: Try JSON parsing first, then LLM extraction as fallback
+            # cv_folds is SOURCE OF TRUTH - always calculate cv_mean and cv_std from folds
+
+            def validate_cv_folds(folds: list[float]) -> tuple[bool, str | None]:
+                """
+                Check if CV folds are valid (not placeholder values like all 0s or all 1s).
+                Returns: (is_valid, error_message)
+                """
+                if not folds or len(folds) == 0:
+                    return False, "Empty cv_folds list"
+
+                # Check for all zeros or all ones (common placeholder bugs)
+                if all(f == 0.0 for f in folds):
+                    msg = f"Invalid CV folds: all {len(folds)} folds are 0.0. This suggests a bug in the CV loop or metric calculation. Real cross-validation should produce non-zero scores."
+                    logger.warning(msg)
+                    return False, msg
+
+                if all(f == 1.0 for f in folds):
+                    msg = f"Invalid CV folds: all {len(folds)} folds are 1.0. This suggests a bug in the CV loop or the use of placeholder values. Real cross-validation should show variance across folds."
+                    logger.warning(msg)
+                    return False, msg
+
+                # Check for suspiciously identical values (no variance)
+                if len(set(folds)) == 1:
+                    msg = f"Suspicious CV folds: all {len(folds)} folds have identical score {folds[0]}. Real cross-validation should show variance across folds. This suggests a bug in the CV loop, metric calculation, or the use of placeholder values. Please verify the CV implementation."
+                    logger.warning(msg)
+                    return False, msg
+                return True, None
+
+            # Track validation errors to update node analysis if cv_folds are invalid
+            cv_validation_error = None
+
+            # Layer 1: Try JSON parsing (primary, fast and structured)
+            if norm is not None and isinstance(norm.get("cv_folds"), list):
+                try:
+                    cv_folds_candidate = [float(v) for v in norm["cv_folds"]]
+                    is_valid, error_msg = validate_cv_folds(cv_folds_candidate)
+                    if is_valid:
+                        node.cv_folds = cv_folds_candidate
+                        # Calculate mean and std FROM folds (source of truth)
+                        node.cv_mean = float(np.mean(node.cv_folds))
+                        node.cv_std = float(np.std(node.cv_folds))
+                        logger.info(f"CV metrics from JSON: mean={node.cv_mean:.6f}, std={node.cv_std:.6f}, folds={len(node.cv_folds)}")
+                    else:
+                        node.cv_folds = None
+                        cv_validation_error = error_msg
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Failed to parse cv_folds from JSON: {e}")
+                    node.cv_folds = None
+
+            # Layer 2: Fallback to LLM-extracted cv_folds (handles any format)
+            if node.cv_folds is None and cv_validation_error is None:
+                cv_folds_raw = response.get("cv_folds")
+                if isinstance(cv_folds_raw, list) and len(cv_folds_raw) > 0:
+                    try:
+                        cv_folds_candidate = [float(v) for v in cv_folds_raw]
+                        is_valid, error_msg = validate_cv_folds(cv_folds_candidate)
+                        if is_valid:
+                            node.cv_folds = cv_folds_candidate
+                            # Calculate mean and std FROM folds (source of truth)
+                            node.cv_mean = float(np.mean(node.cv_folds))
+                            node.cv_std = float(np.std(node.cv_folds))
+                            logger.info(f"CV metrics from LLM: mean={node.cv_mean:.6f}, std={node.cv_std:.6f}, folds={len(node.cv_folds)}")
+                        else:
+                            node.cv_folds = None
+                            cv_validation_error = error_msg
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Failed to parse cv_folds from LLM response: {e}")
+                        node.cv_folds = None
+
+            # If cv_folds validation failed, mark as buggy and update analysis
+            if cv_validation_error is not None:
+                node.is_buggy = True
+                node.metric = WorstMetricValue()
+                # Prepend validation error to existing analysis
+                if node.analysis:
+                    node.analysis = f"[CV VALIDATION ERROR] {cv_validation_error}\n\nOriginal analysis: {node.analysis}"
+                else:
+                    node.analysis = f"[CV VALIDATION ERROR] {cv_validation_error}"
+                logger.error(f"Node {node.step} marked as buggy due to invalid cv_folds")
+
+            # STRICT ENFORCEMENT (when CV is enabled): cv_folds is the SOURCE OF TRUTH
+            # Mark node as buggy if no valid cv_folds found (only if CV is enabled)
+            if self.acfg.k_fold_validation > 1 and node.cv_folds is None and cv_validation_error is None:
+                node.is_buggy = True
+                node.metric = WorstMetricValue()
+                error_msg = (
+                    "Missing CV folds: The code did not report cross-validation fold scores. "
+                    f"Expected {self.acfg.k_fold_validation}-fold CV with all fold scores in cv_folds list. "
+                    "Ensure the code prints AIDE_METRICS_JSON with cv_folds=[...] containing all fold scores."
+                )
+                if node.analysis:
+                    node.analysis = f"[MISSING CV FOLDS] {error_msg}\n\nOriginal analysis: {node.analysis}"
+                else:
+                    node.analysis = f"[MISSING CV FOLDS] {error_msg}"
+                # Set cv_mean/cv_std to None to make it clear there's no valid CV data
+                node.cv_mean = None
+                node.cv_std = None
+                logger.error(f"Node {node.step} marked as buggy due to missing cv_folds")
             if response["is_bug"] or node.exc_type is not None or response["metric"] is None or response["has_csv_submission"] == False or has_csv_submission == False:
                 if response["is_bug"]:
                     logger.warning(f"Node {node.id} is marked as buggy because the response['is_bug'] is True.")
@@ -504,8 +878,10 @@ The memory of previous solutions used to improve performance is provided below:
                 else:
                     logger.warning(f"Node {node.id} is marked as buggy because has_csv_submission is False.")
 
+            # Preserve is_buggy if already set by CV validation
             node.is_buggy = (
-                response["is_bug"]
+                node.is_buggy  # CV validation may have already marked this as buggy
+                or response["is_bug"]
                 or node.exc_type is not None
                 or response["metric"] is None
                 or has_csv_submission == False
@@ -601,8 +977,27 @@ The memory of previous solutions used to improve performance is provided below:
             dict,
             extract_review(completion_text)
         )
-        if not isinstance(response["metric"], float):
+
+        # Prefer structured metrics printed by the runfile when available.
+        # Use FULL output for JSON parsing (not truncated) to avoid cutting JSON line mid-string.
+        full_term_out = "".join(node._term_out)
+        parsed = parse_aide_metrics(full_term_out)
+        norm = normalize_metrics(parsed) if parsed is not None else None
+        if norm is not None:
+            valid = norm.get("valid")
+            if isinstance(valid, (int, float)) and not isinstance(valid, bool):
+                response["metric"] = float(valid)
+            lower_is_better = norm.get("lower_is_better")
+            if isinstance(lower_is_better, bool):
+                response["lower_is_better"] = lower_is_better
+
+        # Coerce metric to float, otherwise treat as missing.
+        metric = response.get("metric")
+        if isinstance(metric, bool) or not isinstance(metric, (int, float)):
             response["metric"] = None
+        else:
+            metric_f = float(metric)
+            response["metric"] = metric_f if math.isfinite(metric_f) else None
 
         # do an extra check, to catch cases where judge fails
         has_csv_submission = (
@@ -610,6 +1005,79 @@ The memory of previous solutions used to improve performance is provided below:
         ).exists()
 
         node.analysis = response["summary"]
+
+        # ---- CV metrics parsing (best-effort in non-tool mode) ----
+        # Always store the reviewer-reported validation metric as a default
+        node.valid_metric = response["metric"] if isinstance(response["metric"], float) else None
+
+        def validate_cv_folds(folds: list[float]) -> tuple[bool, str | None]:
+            if not folds or len(folds) == 0:
+                return False, "Empty cv_folds list"
+
+            if all(f == 0.0 for f in folds):
+                msg = f"Invalid CV folds: all {len(folds)} folds are 0.0. This suggests a bug in the CV loop or metric calculation."
+                logger.warning(msg)
+                return False, msg
+
+            if all(f == 1.0 for f in folds):
+                msg = f"Invalid CV folds: all {len(folds)} folds are 1.0. This suggests a bug in the CV loop or the use of placeholder values."
+                logger.warning(msg)
+                return False, msg
+
+            if len(set(folds)) == 1:
+                msg = f"Suspicious CV folds: all {len(folds)} folds have identical score {folds[0]}."
+                logger.warning(msg)
+                return False, msg
+            return True, None
+
+        cv_validation_error = None
+        if norm is not None and isinstance(norm.get("cv_folds"), list):
+            try:
+                cv_folds_candidate = [float(v) for v in norm["cv_folds"]]
+                is_valid, error_msg = validate_cv_folds(cv_folds_candidate)
+                if is_valid:
+                    node.cv_folds = cv_folds_candidate
+                    node.cv_mean = float(np.mean(node.cv_folds))
+                    node.cv_std = float(np.std(node.cv_folds))
+                    logger.info(
+                        "CV metrics from JSON (no-tool): mean=%.6f, std=%.6f, folds=%s",
+                        node.cv_mean,
+                        node.cv_std,
+                        len(node.cv_folds),
+                    )
+                else:
+                    node.cv_folds = None
+                    cv_validation_error = error_msg
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Failed to parse cv_folds from JSON (no-tool): {e}")
+                node.cv_folds = None
+
+        # If cv_folds validation failed, mark as buggy and update analysis
+        if cv_validation_error is not None:
+            node.is_buggy = True
+            node.metric = WorstMetricValue()
+            if node.analysis:
+                node.analysis = f"[CV VALIDATION ERROR] {cv_validation_error}\n\nOriginal analysis: {node.analysis}"
+            else:
+                node.analysis = f"[CV VALIDATION ERROR] {cv_validation_error}"
+            logger.error(f"Node {node.step} marked as buggy due to invalid cv_folds (no-tool)")
+
+        # STRICT ENFORCEMENT (when CV is enabled): cv_folds is the SOURCE OF TRUTH
+        if self.acfg.k_fold_validation > 1 and node.cv_folds is None and cv_validation_error is None:
+            node.is_buggy = True
+            node.metric = WorstMetricValue()
+            error_msg = (
+                "Missing CV folds: The code did not report cross-validation fold scores. "
+                f"Expected {self.acfg.k_fold_validation}-fold CV with all fold scores in cv_folds list. "
+                "Ensure the code prints AIDE_METRICS_JSON with cv_folds=[...] containing all fold scores."
+            )
+            if node.analysis:
+                node.analysis = f"[MISSING CV FOLDS] {error_msg}\n\nOriginal analysis: {node.analysis}"
+            else:
+                node.analysis = f"[MISSING CV FOLDS] {error_msg}"
+            node.cv_mean = None
+            node.cv_std = None
+            logger.error(f"Node {node.step} marked as buggy due to missing cv_folds (no-tool)")
         
         if response["is_bug"] or node.exc_type is not None or response["metric"] is None or response["has_csv_submission"] == False or has_csv_submission == False:
             if response["is_bug"]:
@@ -623,8 +1091,10 @@ The memory of previous solutions used to improve performance is provided below:
             else:
                 logger.warning(f"Node {node.id} is marked as buggy because has_csv_submission is False.")
 
+        # Preserve is_buggy if already set by CV validation
         node.is_buggy = (
-            response["is_bug"]
+            bool(node.is_buggy)
+            or response["is_bug"]
             or node.exc_type is not None
             or response["metric"] is None
             or has_csv_submission == False
@@ -853,6 +1323,34 @@ The memory of previous solutions used to improve performance is provided below:
                             result_node.is_buggy = True
                             result_node.metric = WorstMetricValue()
                             logger.info(f"Actually, node {result_node.id} did not produce a submission.csv")
+
+                    # If a debug run succeeded, strip any debug subsampling and re-run on full data to get the true metric.
+                    if (
+                        result_node
+                        and result_node.stage == "debug"
+                        and result_node.is_buggy is False
+                        and self._has_debug_subsampling(result_node.code)
+                    ):
+                        logger.info(
+                            f"Debug node {result_node.id} succeeded with debug subsampling; cleaning and re-running on full data."
+                        )
+                        cleaned_code = self._strip_debug_subsampling(result_node.code)
+                        if cleaned_code:
+                            exe_res_full = exec_callback(cleaned_code, result_node.id, True)
+                            result_node.code = cleaned_code
+                            result_node = self.parse_exec_result(node=result_node, exec_result=exe_res_full)
+                            if result_node.is_buggy is False and not (
+                                self.cfg.workspace_dir / "submission" / f"submission_{result_node.id}.csv"
+                            ).exists():
+                                result_node.is_buggy = True
+                                result_node.metric = WorstMetricValue()
+                                logger.info(
+                                    f"After full-data rerun, node {result_node.id} did not produce a submission.csv"
+                                )
+                        else:
+                            logger.warning(
+                                f"Failed to clean debug subsampling for node {result_node.id}; keeping debug result."
+                            )
                     logger.info(f"The metric value of node {result_node.id} is {result_node.metric.value}.")
                     if not self.check_metric_valid(node=result_node):
                         result_node.metric = WorstMetricValue()
@@ -868,6 +1366,11 @@ The memory of previous solutions used to improve performance is provided below:
                             raise ValueError("New node's metric is inconsistent with metrics in the journal.Returning to the parent node to regenerate.")
                         else:
                             self.journal.append(result_node)
+                            if self.bug_consultant:
+                                try:
+                                    self.bug_consultant.learn_from_bug(result_node, journal=self.journal)
+                                except Exception as e:
+                                    logger.warning(f"Bug consultant learn_from_bug failed: {e}")
                             
 
             except Exception as e:

@@ -55,14 +55,31 @@ def compile_prompt_to_md(prompt: PromptType, _header_depth: int = 1) -> str:
     if isinstance(prompt, str):
         return prompt.strip() + "\n"
     elif isinstance(prompt, list):
-        return "\n".join([f"- {s.strip()}" for s in prompt] + ["\n"])
-
-    out = []
-    header_prefix = "#" * _header_depth
-    for k, v in prompt.items():
-        out.append(f"{header_prefix} {k}\n")
-        out.append(compile_prompt_to_md(v, _header_depth=_header_depth + 1))
-    return "\n".join(out)
+        # Handle both lists of strings and lists of dicts/nested structures
+        items = []
+        for s in prompt:
+            if isinstance(s, str):
+                items.append(f"- {s.strip()}")
+            elif isinstance(s, dict):
+                # Recursively compile nested dicts as indented sections
+                nested = compile_prompt_to_md(s, _header_depth=_header_depth + 1)
+                # Indent the nested content
+                indented = "\n".join(["  " + line if line.strip() else "" for line in nested.split("\n")])
+                items.append(indented)
+            else:
+                # Fallback for other types (numbers, bools, etc.)
+                items.append(f"- {str(s)}")
+        return "\n".join(items + ["\n"])
+    elif isinstance(prompt, dict):
+        out = []
+        header_prefix = "#" * _header_depth
+        for k, v in prompt.items():
+            out.append(f"{header_prefix} {k}\n")
+            out.append(compile_prompt_to_md(v, _header_depth=_header_depth + 1))
+        return "\n".join(out)
+    else:
+        # Fallback for other types (numbers, bools, None, etc.)
+        return str(prompt) + "\n"
 
 
 @dataclass
